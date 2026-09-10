@@ -144,16 +144,22 @@ adb -s 127.0.0.1:5555 shell id -u
 1. 启动安卓模拟器或连接安卓设备，分辨率为 `1280x720`。
 2. 确认设备已登录到游戏主界面，并且声呐活动入口可见。
 3. 确认 `template/` 目录下的模板图片能匹配当前界面。
-4. 如需运行指定关卡，在 `main.py` 底部修改 `level`。
+4. 首次调试时，在 `main.py` 底部设置起始关卡，并保持 `level_count = 1`、`manual_steps = True`。
 
 ```python
 if __name__ == "__main__":
     register_exit_cleanup()
-    level = 1
+    start_level = 1
+    level_count = 1
+    manual_steps = True
     try:
         adb.ensure_root_shell()
         cleanup_reject_network("主流程启动")
-        main(level)
+        run_confirmed_levels(
+            start_level=start_level,
+            level_count=level_count,
+            manual_steps=manual_steps,
+        )
     finally:
         cleanup_weak_network("主流程结束")
         cleanup_reject_network("主流程结束")
@@ -164,6 +170,12 @@ if __name__ == "__main__":
 ```powershell
 python main.py
 ```
+
+默认入口会在原有弱网查图结束后进入人工确认的在线重放流程。每个检查点直接按回车表示继续，输入任意非空内容表示立即中止；第一轮请勿关闭 `manual_steps`。在线重放前会先在 DROP 仍生效时关闭游戏，再恢复普通网络并重新进入当前关卡。前两个命中格逐个确认，剩余命中格批量点击，最后在右侧安全区域按 `1 + 3` 次分阶段点击并保存截图。
+
+如需保留原先“只查图、不在线点击”的行为，可从 Python 中继续调用 `main(level)`。完成单关现场验证后，再依次把 `level_count` 改为 `2`、`3` 测试连续关卡；全部稳定后才考虑设置 `manual_steps = False`。
+
+`run_confirmed_levels()` 默认使用 `start_in_activity=None` 自动识别首次启动位于海岛主界面还是海域详情页。从详情页启动时，程序会先退出并走一次包含列表滚动的完整活动入口，以建立后续弱网探测所需的稳定页面位置。
 
 运行结束后，命中可视化图片会保存到：
 

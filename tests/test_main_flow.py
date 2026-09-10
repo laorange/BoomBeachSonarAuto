@@ -1,6 +1,7 @@
 import importlib
 import sys
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 
@@ -30,6 +31,10 @@ class FakeAdb:
     def read_screenshot(self, output_path=None):
         self.calls.append(("read_screenshot", output_path))
         return object()
+
+    def get_screenshot_size(self):
+        self.calls.append(("get_screenshot_size",))
+        return 1280, 720
 
     def swipe(self, start_x, start_y, end_x, end_y):
         self.calls.append(("swipe", start_x, start_y, end_x, end_y))
@@ -82,6 +87,205 @@ class MainFlowTest(unittest.TestCase):
         sys.modules.pop("main", None)
         self.utils.AdbController = self.original_adb_controller
         FakeAdb.instances.clear()
+
+    def make_level_one_result(self):
+        return self.main.LevelScanResult(
+            level=1,
+            hit_map=[
+                [0, 0, 0],
+                [1, 1, 1],
+                [0, 0, 0],
+            ],
+            click_points=[
+                (10, 10),
+                (20, 20),
+                (30, 30),
+                (625, 300),
+                (664, 328),
+                (705, 358),
+                (70, 70),
+                (80, 80),
+                (90, 90),
+            ],
+            base_img=object(),
+            grid_quad=object(),
+            output_path=Path("outputs/hit_map_level_1.png"),
+        )
+
+    def test_manual_checkpoint_continues_only_for_empty_input(self):
+        with patch("builtins.input", return_value=""):
+            self.main.manual_checkpoint("继续")
+
+        with patch("builtins.input", return_value="stop"):
+            with self.assertRaises(self.main.ManualStepAborted):
+                self.main.manual_checkpoint("中止")
+
+    def test_level_scan_result_maps_hit_cells_to_saved_points(self):
+        result = self.make_level_one_result()
+
+        self.assertEqual(result.hit_cells, [(1, 0), (1, 1), (1, 2)])
+        self.assertEqual(
+            result.hit_points,
+            [
+                ((1, 0), (625, 300)),
+                ((1, 1), (664, 328)),
+                ((1, 2), (705, 358)),
+            ],
+        )
+
+    def test_start_position_is_detected_from_current_screenshot(self):
+        def detail_match(_screenshot, template_path):
+            if template_path == self.main.QUIT_ACTIVITY_TEMPLATE:
+                return DummyMatch((40, 38))
+            return None
+
+        with patch.object(self.main, "find_template", side_effect=detail_match):
+            self.assertTrue(self.main.detect_start_in_activity())
+
+        def home_match(_screenshot, template_path):
+            if template_path == self.main.ACTIVITY_BUTTON_TEMPLATE:
+                return DummyMatch((1249, 269))
+            return None
+
+        with patch.object(self.main, "find_template", side_effect=home_match):
+            self.assertFalse(self.main.detect_start_in_activity())
+
+    def test_detail_start_is_normalized_through_full_activity_entry(self):
+        expected = self.make_level_one_result()
+
+        with (
+            patch.object(
+                self.main,
+                "wait_until_occur",
+                return_value=DummyMatch((40, 38)),
+            ),
+            patch.object(self.main, "click_template", return_value=True) as quit_click,
+            patch.object(self.main, "enter_activity") as enter,
+            patch.object(
+                self.main,
+                "handle_game_level",
+                return_value=(object(), object(), expected.click_points),
+            ),
+            patch.object(self.main, "_save_level_scan", return_value=expected),
+        ):
+            result = self.main.discover_level(1, already_in_activity=True)
+
+        self.assertIs(result, expected)
+        quit_click.assert_called_once()
+        enter.assert_called_once_with()
+        self.assertIn(
+            ("enable_weak_network", self.main.GAME_PACKAGE_NAME),
+            self.adb.calls,
+        )
+
+    def test_prepare_online_replay_closes_app_before_restoring_network(self):
+        result = self.make_level_one_result()
+        self.adb.weak_network_enabled = True
+        waits = iter(
+            [
+                DummyMatch((10, 20)),  # 登录按钮
+                DummyMatch((30, 40)),  # 活动入口
+                DummyMatch((50, 60)),  # 活动详情页
+            ]
+        )
+
+        with patch.object(
+            self.main,
+            "wait_until_occur",
+            side_effect=lambda *args, **kwargs: next(waits),
+        ):
+            self.main.prepare_online_replay(result, manual_steps=False)
+
+        package_name = self.main.GAME_PACKAGE_NAME
+        close_index = self.adb.calls.index(("close_app", package_name))
+        disable_index = self.adb.calls.index(("disable_weak_network", package_name))
+        open_index = self.adb.calls.index(("open_app", package_name))
+        self.assertLess(close_index, disable_index)
+        self.assertLess(disable_index, open_index)
+        self.assertIn(("click", 10, 20), self.adb.calls)
+        self.assertIn(("click", 30, 40), self.adb.calls)
+        self.assertIn(("click", 1205, 644), self.adb.calls)
+
+    def test_validation_rejects_incomplete_hit_map_before_any_replay(self):
+        result = self.make_level_one_result()
+        result.hit_map[1][2] = 0
+        self.adb.weak_network_enabled = True
+
+        with self.assertRaisesRegex(RuntimeError, "命中格数量异常"):
+            self.main.validate_replay_ready(result)
+
+        self.assertNotIn("click", [call[0] for call in self.adb.calls])
+
+    def test_replay_clicks_first_two_then_remaining_hit_points(self):
+        result = self.make_level_one_result()
+
+        with (
+            patch.object(
+                self.main,
+                "_save_replay_screenshot",
+                side_effect=lambda level, name: Path(f"{level}_{name}.png"),
+            ),
+            patch.object(self.main, "find_template", return_value=None),
+        ):
+            self.main.replay_discovered_hits(result, manual_steps=False)
+
+        clicks = [call for call in self.adb.calls if call[0] == "click"]
+        self.assertEqual(
+            clicks,
+            [
+                ("click", 625, 300),
+                ("click", 664, 328),
+                ("click", 705, 358),
+            ],
+        )
+
+    def test_safe_advance_uses_one_then_three_taps_at_calibrated_point(self):
+        with patch.object(
+            self.main,
+            "_save_replay_screenshot",
+            side_effect=lambda level, name: Path(f"{level}_{name}.png"),
+        ):
+            self.main.advance_with_safe_taps(1, manual_steps=False)
+
+        safe_click = ("click", *self.main.SAFE_ADVANCE_POINT)
+        self.assertEqual(self.adb.calls.count(safe_click), 4)
+
+    def test_two_level_run_reuses_the_advanced_activity_page(self):
+        first = self.make_level_one_result()
+        second = self.make_level_one_result()
+        second.level = 2
+        second.output_path = Path("outputs/hit_map_level_2.png")
+
+        with (
+            patch.object(
+                self.main,
+                "discover_level",
+                side_effect=[first, second],
+            ) as discover,
+            patch.object(self.main, "prepare_online_replay"),
+            patch.object(self.main, "replay_discovered_hits"),
+            patch.object(self.main, "advance_with_safe_taps"),
+        ):
+            outputs = self.main.run_confirmed_levels(
+                start_level=1,
+                level_count=2,
+                manual_steps=False,
+            )
+
+        self.assertEqual(
+            discover.call_args_list,
+            [
+                unittest.mock.call(1, already_in_activity=None),
+                unittest.mock.call(2, already_in_activity=True),
+            ],
+        )
+        self.assertEqual(
+            outputs,
+            [
+                Path("outputs/hit_map_level_1.png"),
+                Path("outputs/hit_map_level_2.png"),
+            ],
+        )
 
     def test_manual_recovery_offer_cancel_keeps_network_rules_untouched(self):
         self.adb.weak_network_enabled = True

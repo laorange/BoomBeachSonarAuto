@@ -1,5 +1,6 @@
 import atexit
 import signal
+from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic, sleep
 
@@ -39,9 +40,12 @@ ACTIVITY_BUTTON_TEMPLATE = TEMPLATE_DIR / "activity_button.png"
 LOGIN_TEMPLATE = TEMPLATE_DIR / "login.png"
 QUIT_ACTIVITY_TEMPLATE = TEMPLATE_DIR / "quit_activity.png"
 RETRY_TEMPLATE = TEMPLATE_DIR / "retry.png"
+WIN_TEMPLATE = TEMPLATE_DIR / "win.png"
 
 ACTIVITY_DETAIL_POINT = (1205, 644)
 ACTIVITY_LIST_SWIPE = (1000, 660, 1000, 180)
+SAFE_ADVANCE_POINT = (1000, 500)
+ONLINE_CLICK_INTERVAL_SECONDS = 2.0
 RUN_DEBUG_DIR = SCREENSHOT_DIR / "run_debug"
 
 _weak_network_cleanup_done = False
@@ -50,6 +54,48 @@ _active_probe: "ProbeTransaction | None" = None
 
 class ManualNetworkRecoveryError(RuntimeError):
     """人工核验后仍无法完整清除断网规则。"""
+
+
+class ManualStepAborted(RuntimeError):
+    """用户在人工调试检查点输入内容并主动中止。"""
+
+
+@dataclass
+class LevelScanResult:
+    """一次弱网查图的结果，以及在线重放所需的原始坐标。"""
+
+    level: int
+    hit_map: list[list[int]]
+    click_points: list[tuple[int, int]]
+    base_img: np.ndarray
+    grid_quad: np.ndarray
+    output_path: Path
+
+    @property
+    def hit_cells(self) -> list[Cell]:
+        return [
+            (row, col)
+            for row, values in enumerate(self.hit_map)
+            for col, hit in enumerate(values)
+            if hit == 1
+        ]
+
+    @property
+    def hit_points(self) -> list[tuple[Cell, tuple[int, int]]]:
+        grid_size = len(self.hit_map)
+        return [
+            (cell, self.click_points[cell[0] * grid_size + cell[1]])
+            for cell in self.hit_cells
+        ]
+
+
+@dataclass(frozen=True)
+class OnlineReplayResult:
+    """一次在线重放的点击数量和关卡完成状态。"""
+
+    clicked_count: int
+    level_completed: bool
+    screenshot_path: Path
 
 
 def _has_pending_probe_request() -> bool:
@@ -233,7 +279,7 @@ def handle_game_level(
     level: int,
     hit_map: list[list[int]],
     run_started_at: float | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, list[tuple[int, int]]]:
     """处理单个关卡：有潜艇配置时策略选点，缺少配置时回退逐格扫描。"""
     adb.delay(1.5)
     grid_img = adb.read_screenshot()
@@ -258,7 +304,7 @@ def handle_game_level(
             run_started_at=run_started_at,
         )
 
-    return grid_img, grid_quad
+    return grid_img, grid_quad, click_points
 
 
 def _scan_level_by_grid_order(
@@ -623,40 +669,436 @@ def click_template(
     return True
 
 
-def main(level: int) -> Path | None:
-    """执行指定关卡的逻辑探测并输出命中图。"""
+def _save_level_scan(
+    level: int,
+    hit_map: list[list[int]],
+    click_points: list[tuple[int, int]],
+    base_img: np.ndarray,
+    quad: np.ndarray,
+) -> LevelScanResult:
+    """保存查图结果，并整理在线重放需要的数据。"""
+    out_path = OUTPUT_DIR / f"hit_map_level_{level}.png"
+    save_hit_map_image(base_img, quad, hit_map, out_path)
+    logger.info("命中矩阵：%s", hit_map)
+    logger.info("命中可视化图片已保存：%s", out_path)
+    return LevelScanResult(
+        level=level,
+        hit_map=hit_map,
+        click_points=click_points,
+        base_img=base_img,
+        grid_quad=quad,
+        output_path=out_path,
+    )
+
+
+def detect_start_in_activity() -> bool:
+    """自动判断首次启动位于海岛主界面还是关卡详情页。"""
+    screenshot = adb.read_screenshot()
+    if find_template(screenshot, QUIT_ACTIVITY_TEMPLATE) is not None:
+        logger.info("自动识别首次启动位置：关卡详情页")
+        return True
+    if find_template(screenshot, ACTIVITY_BUTTON_TEMPLATE) is not None:
+        logger.info("自动识别首次启动位置：海岛主界面")
+        return False
+    raise RuntimeError("无法识别首次启动位置：既不是海岛主界面，也不是关卡详情页")
+
+
+def discover_level(
+    level: int,
+    *,
+    already_in_activity: bool | None = False,
+) -> LevelScanResult | None:
+    """执行现有弱网查图逻辑，可从主界面或当前关卡详情页开始。"""
     run_started_at = monotonic()
     grid_size = get_level_grid_size(level)
     hit_map = [[0] * grid_size for _ in range(grid_size)]
     try:
-        disable_weak_network()
+        if already_in_activity is None:
+            already_in_activity = detect_start_in_activity()
 
-        if find_template(adb.read_screenshot(), ACTIVITY_BUTTON_TEMPLATE) is None:
-            logger.error("当前不在海岛主界面，无法启动脚本")
-            return None
+        if already_in_activity:
+            if wait_until_occur(QUIT_ACTIVITY_TEMPLATE, timeout=6) is None:
+                logger.error("当前不在下一关详情页，无法继续查图")
+                return None
 
-        enter_activity()
-        base_img, quad = handle_game_level(
+            # 从详情页直接开始时，活动列表的滚动位置可能尚未建立。
+            # 先在没有待发送请求的情况下退出，再走一次完整入口，确保后续
+            # re_enter=True 能继续使用已滚动到声呐活动的位置。
+            enable_weak_network(0.2)
+            if not click_template(
+                QUIT_ACTIVITY_TEMPLATE,
+                RUN_DEBUG_DIR / f"level_{level}_normalize_start.png",
+            ):
+                raise RuntimeError("规范化启动位置时未能退出关卡详情页")
+            enter_activity()
+        else:
+            disable_weak_network()
+            if find_template(adb.read_screenshot(), ACTIVITY_BUTTON_TEMPLATE) is None:
+                logger.error("当前不在海岛主界面，无法启动脚本")
+                return None
+            enter_activity()
+
+        base_img, quad, click_points = handle_game_level(
             level,
             hit_map,
             run_started_at=run_started_at,
         )
-        out_path = OUTPUT_DIR / f"hit_map_level_{level}.png"
-        save_hit_map_image(base_img, quad, hit_map, out_path)
-        logger.info("命中矩阵：%s", hit_map)
-        logger.info("命中可视化图片已保存：%s", out_path)
-        return out_path
+        return _save_level_scan(
+            level,
+            hit_map,
+            click_points,
+            base_img,
+            quad,
+        )
     finally:
         logger.info("脚本总运行时间：%s", format_elapsed(monotonic() - run_started_at))
 
 
+def main(level: int) -> Path | None:
+    """兼容原有用法：只查指定关卡并输出命中图，不在线重放。"""
+    result = discover_level(level)
+    return result.output_path if result is not None else None
+
+
+def manual_checkpoint(message: str, enabled: bool = True) -> None:
+    """直接回车继续；输入任意非空内容时中止调试流程。"""
+    if not enabled:
+        return
+
+    logger.warning("[人工确认] %s", message)
+    answer = input(
+        f"\n[人工确认] {message}\n"
+        "正确请直接按回车；不正确请输入任意字符后按回车以中止："
+    )
+    if answer.strip():
+        raise ManualStepAborted(f"用户在检查点中止：{message}")
+
+
+def validate_replay_ready(result: LevelScanResult) -> None:
+    """只读检查查图结果与网络事务，失败时禁止在线重放。"""
+    submarines = get_configured_submarines(result.level, SUBMARINES)
+    if submarines is None:
+        raise RuntimeError(f"第 {result.level} 关缺少潜艇配置，拒绝在线重放")
+
+    expected_hits = sum(submarines)
+    actual_hits = len(result.hit_cells)
+    if actual_hits != expected_hits:
+        raise RuntimeError(
+            f"第 {result.level} 关命中格数量异常："
+            f"expected={expected_hits} actual={actual_hits}，拒绝在线重放"
+        )
+
+    expected_points = len(result.hit_map) ** 2
+    if len(result.click_points) != expected_points:
+        raise RuntimeError(
+            f"第 {result.level} 关坐标数量异常："
+            f"expected={expected_points} actual={len(result.click_points)}"
+        )
+
+    if _active_probe is not None:
+        raise ProbeProtocolError(
+            f"最后一次探测事务尚未清空：phase={_active_probe.phase.name}"
+        )
+    if adb.is_reject_network_enabled(GAME_PACKAGE_NAME):
+        raise ProbeProtocolError("仍检测到 REJECT 规则，拒绝在线重放")
+    if not adb.is_weak_network_enabled(GAME_PACKAGE_NAME):
+        raise ProbeProtocolError("查图结束后未检测到 DROP，现场状态不可信")
+
+
+def _format_hit_points(result: LevelScanResult) -> str:
+    return ", ".join(
+        f"{number}:{cell}->{point}"
+        for number, (cell, point) in enumerate(result.hit_points, start=1)
+    )
+
+
+def _save_replay_screenshot(level: int, name: str) -> Path:
+    path = RUN_DEBUG_DIR / f"level_{level}_{name}.png"
+    adb.read_screenshot(path)
+    logger.info("在线重放截图已保存：%s", path)
+    return path
+
+
+def _enter_activity_online(max_retries: int = 3) -> None:
+    """保持普通网络进入活动详情页，不改动现有弱网进入函数。"""
+    for attempt in range(1, max_retries + 1):
+        activity = wait_until_occur(ACTIVITY_BUTTON_TEMPLATE, timeout=30)
+        if activity is None:
+            logger.warning("在线进入时未找到活动按钮 (%s/%s)", attempt, max_retries)
+            continue
+
+        adb.click(*activity.center)
+        adb.delay(ONLINE_CLICK_INTERVAL_SECONDS).swipe(*ACTIVITY_LIST_SWIPE)
+        adb.delay(ONLINE_CLICK_INTERVAL_SECONDS).swipe(*ACTIVITY_LIST_SWIPE)
+        adb.delay(ONLINE_CLICK_INTERVAL_SECONDS).click(*ACTIVITY_DETAIL_POINT)
+        if wait_until_occur(QUIT_ACTIVITY_TEMPLATE, timeout=15) is not None:
+            return
+
+        logger.warning("在线进入活动详情页失败 (%s/%s)", attempt, max_retries)
+
+    raise RuntimeError(f"在线进入活动详情页失败，已重试 {max_retries} 次")
+
+
+def prepare_online_replay(
+    result: LevelScanResult,
+    *,
+    manual_steps: bool = True,
+) -> None:
+    """在 DROP 下关闭游戏，恢复普通网络后重新登录当前关卡。"""
+    validate_replay_ready(result)
+    logger.info("第 %s 关在线重放坐标：%s", result.level, _format_hit_points(result))
+    manual_checkpoint(
+        f"第 {result.level} 关查图完成。命中矩阵={result.hit_map}；"
+        f"点击坐标={_format_hit_points(result)}；命中图={result.output_path}",
+        manual_steps,
+    )
+
+    # 先在 DROP 仍生效时结束进程，再恢复网络，避免意外缓存请求补发。
+    adb.close_app(GAME_PACKAGE_NAME)
+    adb.delay(1.0)
+    disable_weak_network()
+    adb.disable_reject_network(GAME_PACKAGE_NAME)
+    if adb.is_weak_network_enabled(GAME_PACKAGE_NAME):
+        raise ManualNetworkRecoveryError("重新打开游戏前 DROP 规则仍然存在")
+    if adb.is_reject_network_enabled(GAME_PACKAGE_NAME):
+        raise ManualNetworkRecoveryError("重新打开游戏前 REJECT 规则仍然存在")
+
+    adb.open_app(GAME_PACKAGE_NAME)
+    login_img = wait_until_occur(LOGIN_TEMPLATE, timeout=30)
+    if login_img is None:
+        raise RuntimeError("重新打开游戏后未找到登录按钮")
+    adb.click(*login_img.center)
+    adb.delay(ONLINE_CLICK_INTERVAL_SECONDS)
+    _enter_activity_online()
+
+    before_path = _save_replay_screenshot(result.level, "online_before_clicks")
+    manual_checkpoint(
+        f"游戏已在普通网络下重新进入第 {result.level} 关，"
+        f"真实点击前截图={before_path}",
+        manual_steps,
+    )
+
+
+def replay_discovered_hits(
+    result: LevelScanResult,
+    *,
+    manual_steps: bool = True,
+    max_online_clicks: int | None = None,
+    online_clicks_used: int = 0,
+) -> OnlineReplayResult:
+    """前两个命中格逐个确认，随后批量点击剩余命中格。"""
+    hit_points = result.hit_points
+    if not hit_points:
+        raise RuntimeError(f"第 {result.level} 关没有可在线重放的命中格")
+
+    if max_online_clicks is not None and max_online_clicks <= 0:
+        raise ValueError(f"max_online_clicks 必须大于 0: {max_online_clicks}")
+
+    allowed_clicks = len(hit_points)
+    if max_online_clicks is not None:
+        allowed_clicks = min(allowed_clicks, max_online_clicks)
+
+    adb.delay(ONLINE_CLICK_INTERVAL_SECONDS)
+    individually_checked = min(2, allowed_clicks)
+    for index in range(individually_checked):
+        cell, point = hit_points[index]
+        adb.click(*point)
+        adb.delay(ONLINE_CLICK_INTERVAL_SECONDS)
+        screenshot_path = _save_replay_screenshot(
+            result.level,
+            f"after_click_{index + 1:02d}",
+        )
+        manual_checkpoint(
+            f"已真实点击本关第 {index + 1}/{len(hit_points)} 个命中格："
+            f"cell={cell} point={point}；"
+            f"累计有效弹药点击={online_clicks_used + index + 1}；"
+            f"截图={screenshot_path}",
+            manual_steps,
+        )
+
+    for index in range(individually_checked, allowed_clicks):
+        cell, point = hit_points[index]
+        logger.info(
+            "批量真实点击本关第 %s/%s 个命中格：cell=%s point=%s 累计=%s",
+            index + 1,
+            len(hit_points),
+            cell,
+            point,
+            online_clicks_used + index + 1,
+        )
+        adb.click(*point)
+        adb.delay(ONLINE_CLICK_INTERVAL_SECONDS)
+
+    level_completed = allowed_clicks == len(hit_points)
+    screenshot_name = "finished" if level_completed else "ammo_limit_reached"
+    finished_path = _save_replay_screenshot(result.level, screenshot_name)
+    cumulative_clicks = online_clicks_used + allowed_clicks
+
+    if not level_completed:
+        manual_checkpoint(
+            f"有效弹药点击已达到上限 {cumulative_clicks}。"
+            f"第 {result.level} 关只点击了 {allowed_clicks}/{len(hit_points)} 个命中格，"
+            f"不会继续点击或推进关卡；截图={finished_path}",
+            manual_steps,
+        )
+        return OnlineReplayResult(
+            clicked_count=allowed_clicks,
+            level_completed=False,
+            screenshot_path=finished_path,
+        )
+
+    finished_img = adb.read_screenshot()
+    win_match = find_template(finished_img, WIN_TEMPLATE)
+    logger.info(
+        "第 %s 关完成截图的 win 模板识别结果：%s",
+        result.level,
+        f"score={win_match.score:.3f}" if win_match is not None else "未匹配",
+    )
+    manual_checkpoint(
+        f"第 {result.level} 关全部命中格已点完。请确认这是通关状态；"
+        f"累计有效弹药点击={cumulative_clicks}；截图={finished_path}；"
+        f"win模板={'已匹配' if win_match else '未匹配'}",
+        manual_steps,
+    )
+    return OnlineReplayResult(
+        clicked_count=allowed_clicks,
+        level_completed=True,
+        screenshot_path=finished_path,
+    )
+
+
+def advance_with_safe_taps(
+    level: int,
+    *,
+    manual_steps: bool = True,
+) -> None:
+    """在右侧安全水域先点一次、再点三次，并分阶段保存截图。"""
+    width, height = adb.get_screenshot_size()
+    if (width, height) != (1280, 720):
+        raise RuntimeError(
+            f"安全点击仅校准于 1280x720，当前为 {width}x{height}，拒绝点击"
+        )
+
+    adb.click(*SAFE_ADVANCE_POINT)
+    adb.delay(ONLINE_CLICK_INTERVAL_SECONDS)
+    first_path = _save_replay_screenshot(level, "after_one_safe_tap")
+    manual_checkpoint(
+        f"已在右侧安全区域 {SAFE_ADVANCE_POINT} 点击 1 次。"
+        f"请确认画面正常；截图={first_path}",
+        manual_steps,
+    )
+
+    for _ in range(3):
+        adb.click(*SAFE_ADVANCE_POINT)
+        adb.delay(ONLINE_CLICK_INTERVAL_SECONDS)
+    final_path = _save_replay_screenshot(level, "after_four_safe_taps")
+    manual_checkpoint(
+        f"已在右侧安全区域累计点击 4 次。"
+        f"请确认已经安全进入第 {level + 1} 关；截图={final_path}",
+        manual_steps,
+    )
+
+
+def run_confirmed_levels(
+    start_level: int,
+    level_count: int | None = 1,
+    *,
+    manual_steps: bool = True,
+    start_in_activity: bool | None = None,
+    online_click_limit: int | None = None,
+) -> list[Path]:
+    """连续过关，并可按普通网络下的有效格点击总数终止。"""
+    if level_count is not None and level_count <= 0:
+        raise ValueError(f"level_count 必须大于 0: {level_count}")
+    if online_click_limit is not None and online_click_limit <= 0:
+        raise ValueError(
+            f"online_click_limit 必须大于 0: {online_click_limit}"
+        )
+
+    configured_level_count = max(LEVEL_GRID_SIZES) - start_level + 1
+    levels_to_run = level_count if level_count is not None else configured_level_count
+    end_level = start_level + levels_to_run - 1
+    if start_level not in LEVEL_GRID_SIZES or end_level not in LEVEL_GRID_SIZES:
+        raise ValueError(f"连续关卡范围未配置：{start_level}..{end_level}")
+
+    outputs: list[Path] = []
+    online_clicks_used = 0
+    already_in_activity = start_in_activity
+    for offset in range(levels_to_run):
+        if (
+            online_click_limit is not None
+            and online_clicks_used >= online_click_limit
+        ):
+            break
+
+        level = start_level + offset
+        result = discover_level(level, already_in_activity=already_in_activity)
+        if result is None:
+            raise RuntimeError(f"第 {level} 关查图未能启动")
+
+        outputs.append(result.output_path)
+        prepare_online_replay(result, manual_steps=manual_steps)
+        remaining_online_clicks = None
+        if online_click_limit is not None:
+            remaining_online_clicks = online_click_limit - online_clicks_used
+
+        replay = replay_discovered_hits(
+            result,
+            manual_steps=manual_steps,
+            max_online_clicks=remaining_online_clicks,
+            online_clicks_used=online_clicks_used,
+        )
+        online_clicks_used += replay.clicked_count
+
+        if not replay.level_completed:
+            logger.info(
+                "有效弹药点击达到上限：used=%s limit=%s；停止于第 %s 关",
+                online_clicks_used,
+                online_click_limit,
+                level,
+            )
+            break
+        if (
+            online_click_limit is not None
+            and online_clicks_used >= online_click_limit
+        ):
+            logger.info(
+                "有效弹药点击达到上限：used=%s limit=%s；"
+                "本关已完成，但不再点击安全区域",
+                online_clicks_used,
+                online_click_limit,
+            )
+            break
+
+        advance_with_safe_taps(level, manual_steps=manual_steps)
+        already_in_activity = True
+
+    logger.info(
+        "连续流程结束：完成查图关数=%s，有效弹药点击=%s，限制=%s",
+        len(outputs),
+        online_clicks_used,
+        online_click_limit,
+    )
+    return outputs
+
+
 if __name__ == "__main__":
     register_exit_cleanup()
-    level = 2
+    start_level = 4
+    level_count = None
+    manual_steps = False
+    start_in_activity = None
+    online_click_limit = 300
     try:
         adb.ensure_root_shell()
         cleanup_reject_network("主流程启动")
-        main(level)
+        run_confirmed_levels(
+            start_level=start_level,
+            level_count=level_count,
+            manual_steps=manual_steps,
+            start_in_activity=start_in_activity,
+            online_click_limit=online_click_limit,
+        )
     except BaseException:
         if _has_pending_probe_request():
             offer_manual_network_recovery()
